@@ -198,15 +198,17 @@ def _qkv(block, y):
 
 def _attention(q, k, v, block, pe, transformer_options, kv_capture=None, kv_cache=None):
     """comfy moss_image ``attention`` with optional K/V capture or cached-K/V
-    injection, both post-RoPE. Cached keys are already RoPE'd at their own
-    positions."""
+    injection. Keys are captured *before* RoPE (normed only) so one cache can
+    serve any text length; injected keys must already be RoPE'd at their
+    positions for the current pass."""
     B, N, _ = q.shape
     heads = block.num_heads
     q = rope_split_half(block.q_norm(q.view(B, N, heads, -1)), pe)
-    k = rope_split_half(block.k_norm(k.view(B, N, heads, -1)), pe)
+    k = block.k_norm(k.view(B, N, heads, -1))
     v = v.view(B, N, heads, -1)
     if kv_capture is not None:
         kv_capture.append((k, v))
+    k = rope_split_half(k, pe)
     if kv_cache is not None:
         k = torch.cat((k, kv_cache[0].to(k.dtype)), dim=1)
         v = torch.cat((v, kv_cache[1].to(v.dtype)), dim=1)
@@ -328,40 +330,55 @@ def _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_optio
 # ---------------------------------------------------------------------------
 
 
-def _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, transformer_options):
+def _precompute_ref_kv(dit, x, timestep, ref_latents, transformer_options, reuse=None, reuse_upto=0, store_device=None):
     """Run only the clean reference tokens through the blocks at t=0 and record
-    each block's post-RoPE K/V.
+    each block's K (post-norm, pre-RoPE) and V.
 
-    A kv_cache LoRA never lets ref tokens see the text / noisy tokens, so this
-    standalone pass produces exactly the K/V the refs would contribute inside
-    a joint pass -- and they are timestep-invariant, so one pass serves the
-    whole denoise. Skipped blocks (layer skipping on this branch) record
+    A kv_cache LoRA never lets ref tokens see the text / noisy tokens, and all
+    ref tokens share one frame coordinate, so this pass is independent of both
+    the text length (RoPE is relative; the shared offset cancels) and the batch
+    size. It therefore runs once at the refs' own batch size (normally 1) and
+    is shared by cond, uncond and every batch item.
+
+    ``reuse``/``reuse_upto``: blocks ``< reuse_upto`` are identical to an
+    existing cache built with a different skip-layer set (the two passes only
+    diverge at the first block where their skip sets differ), so those entries
+    are shared by reference instead of stored twice. Skipped blocks record
     nothing; the live pass skips them too."""
-    B = x.shape[0]
     dtype, device = x.dtype, x.device
     transformer_options = transformer_options.copy()
-    reftok, refids = _pack_refs(dit, ref_latents, B, text_len, device, dtype)
+    rb = max(r.shape[0] for r in ref_latents)
+    reftok, refids = _pack_refs(dit, ref_latents, rb, 0, device, dtype)
     pe = _pe(dit, refids)
-    vec0 = _time_vec(dit, torch.zeros_like(timestep), dtype)
+    vec0 = _time_vec(dit, torch.zeros(rb, device=device, dtype=timestep.dtype), dtype)
     mod0 = _modulation(dit, vec0)
     h = dit.video_embedder(reftok)
 
     ref_kv = {}
 
     def block_fn(block, h, i):
+        if reuse is not None and i < reuse_upto:
+            if i in reuse:
+                ref_kv[i] = reuse[i]
+            return _block_kv_forward(block, h, mod0, pe, transformer_options)
         cap = []
         h = _block_kv_forward(block, h, mod0, pe, transformer_options, kv_capture=cap)
-        ref_kv[i] = cap[0]
+        k, v = cap[0]
+        if store_device is not None and store_device.type == "cpu":
+            k = k.to("cpu").pin_memory() if torch.cuda.is_available() else k.to("cpu")
+            v = v.to("cpu").pin_memory() if torch.cuda.is_available() else v.to("cpu")
+        ref_kv[i] = (k, v)
         return h
 
     _run_blocks(dit, h, block_fn, vec0, mod0, pe, transformer_options)
     return ref_kv
 
 
-def _forward_with_cached_refs(dit, x, timestep, context, ref_kv, transformer_options):
+def _forward_with_cached_refs(dit, x, timestep, context, ref_kv, ref_pe, transformer_options):
     """Denoising pass with the reference tokens replaced by their cached K/V:
     the live sequence is just noisy image + text tokens, and every block's
-    attention appends the cached ref K/V as extra keys."""
+    attention appends the cached ref K/V (RoPE'd here at this pass's text
+    length, broadcast to the batch) as extra keys."""
     B, _, H, W = x.shape
     dtype, device = x.dtype, x.device
     transformer_options = transformer_options.copy()
@@ -375,23 +392,45 @@ def _forward_with_cached_refs(dit, x, timestep, context, ref_kv, transformer_opt
     txt = dit.text_embedder(context, pe[:, n_img:], transformer_options)
     h = torch.cat((dit.video_embedder(x.flatten(2).transpose(1, 2)), txt), dim=1)
 
+    def live_kv(i):
+        entry = ref_kv.get(i)
+        if entry is None:
+            return None
+        k, v = entry
+        k = k.to(device, dtype, non_blocking=True)
+        v = v.to(device, dtype, non_blocking=True)
+        k = rope_split_half(k, ref_pe)
+        if k.shape[0] != B:
+            if k.shape[0] == 1:
+                k, v = k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1)
+            else:
+                k = comfy.utils.repeat_to_batch_size(k, B)
+                v = comfy.utils.repeat_to_batch_size(v, B)
+        return k, v
+
     def block_fn(block, h, i):
-        return _block_kv_forward(block, h, mod, pe, transformer_options, kv_cache=ref_kv.get(i))
+        return _block_kv_forward(block, h, mod, pe, transformer_options, kv_cache=live_kv(i))
 
     h = _run_blocks(dit, h, block_fn, vec, mod, pe, transformer_options)
     return _finish(dit, h, vec, n_img, B, H, W)
 
 
-def _ref_fingerprint(ref_latents, bs, text_len, skipped):
-    """Cheap content key for the ref K/V cache: batch size, text length (the
-    refs' RoPE frame coordinate), skipped blocks, and per-ref shape plus two
+def _ref_fingerprint(ref_latents):
+    """Cheap content key for the ref K/V cache: per-ref shape plus two
     reduction sums (the ref tensors are rebuilt per step by comfy's cond
-    batching, so object identity can't be used)."""
-    key = [bs, text_len, skipped]
+    batching, so object identity can't be used). Batch size and text length
+    are deliberately excluded: the cache is independent of both."""
+    key = []
     for r in ref_latents:
         rf = r.float()
         key.append((tuple(r.shape), float(rf.sum()), float(rf.square().sum())))
     return tuple(key)
+
+
+def _divergence(skip_a, skip_b, n_blocks):
+    """First block index where two skip-layer sets differ (n_blocks if equal)."""
+    diff = set(skip_a) ^ set(skip_b)
+    return min(diff) if diff else n_blocks
 
 
 class MOSSImageOstrisEditModelPatch:
@@ -415,7 +454,21 @@ class MOSSImageOstrisEditModelPatch:
                         ),
                     },
                 ),
-            }
+            },
+            "optional": {
+                "cache_device": (
+                    ["gpu", "cpu"],
+                    {
+                        "default": "gpu",
+                        "tooltip": (
+                            "Where the reference K/V cache lives. 'cpu' keeps it "
+                            "in pinned system RAM and streams one block at a "
+                            "time to the GPU: near-zero extra VRAM, slightly "
+                            "slower steps."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -429,7 +482,7 @@ class MOSSImageOstrisEditModelPatch:
         "off for a LoRA trained with kv_cache disabled."
     )
 
-    def patch(self, model, kv_cache=True):
+    def patch(self, model, kv_cache=True, cache_device="gpu"):
         m = model.clone()
         base_model = m.model
         dit = m.get_model_object("diffusion_model")
@@ -438,6 +491,7 @@ class MOSSImageOstrisEditModelPatch:
         orig_extra_conds_shapes = base_model.extra_conds_shapes
         orig_forward = dit.forward
         latent_channels = dit.latent_channels
+        store_device = torch.device("cpu") if cache_device == "cpu" else None
 
         def extra_conds(**kwargs):
             out = orig_extra_conds(**kwargs)
@@ -457,13 +511,23 @@ class MOSSImageOstrisEditModelPatch:
                 )
             return out
 
-        # Ref K/V cache for the kv_cache toggle: filled by a single ref-only
-        # pass per run (t=0, refs attend only to each other, matching training)
-        # and reused by every denoising call. Cleared at the start of each
-        # sampling run so LoRA/weight changes between runs never serve stale
-        # K/V; keyed on ref content + batch size + text length + skipped
-        # blocks so cond/uncond coexist.
-        state = {"last_sigma": None, "caches": {}}
+        # caches: {ref_fingerprint: {skipped_blocks: ref_kv}}
+        # pes:    {(ref_fingerprint, text_len): ref RoPE}
+        state = {"last_sigma": None, "caches": {}, "pes": {}}
+
+        def clear():
+            state["caches"].clear()
+            state["pes"].clear()
+            state["last_sigma"] = None
+
+        def outer_sample_wrapper(executor, *args, **kwargs):
+            # Fresh cache per sampling run, and released as soon as the run
+            # ends instead of sitting in VRAM until the next one.
+            clear()
+            try:
+                return executor(*args, **kwargs)
+            finally:
+                clear()
 
         def forward(x, timestep, context, transformer_options={}, ref_latents=None, **kwargs):
             if ref_latents is None or len(ref_latents) == 0:
@@ -471,8 +535,8 @@ class MOSSImageOstrisEditModelPatch:
             if not kv_cache:
                 return _forward_with_refs(dit, x, timestep, context, ref_latents, transformer_options)
 
-            # New-run detection: sigmas only decrease within a run, and the
-            # first call of a run sits at sample_sigmas[0] when available.
+            # Fallback new-run detection (if the outer-sample wrapper is
+            # unavailable): sigmas only decrease within a run.
             sig = float(timestep.max())
             sample_sigmas = transformer_options.get("sample_sigmas", None)
             new_run = state["last_sigma"] is None or sig > state["last_sigma"]
@@ -480,20 +544,47 @@ class MOSSImageOstrisEditModelPatch:
                 new_run = True
             if new_run:
                 state["caches"].clear()
+                state["pes"].clear()
             state["last_sigma"] = sig
 
             text_len = context.shape[1]
-            key = _ref_fingerprint(ref_latents, x.shape[0], text_len, _skipped_blocks(transformer_options))
-            ref_kv = state["caches"].get(key)
+            fp = _ref_fingerprint(ref_latents)
+            skipped = _skipped_blocks(transformer_options)
+            by_skip = state["caches"].setdefault(fp, {})
+            ref_kv = by_skip.get(skipped)
             if ref_kv is None:
-                ref_kv = _precompute_ref_kv(dit, x, timestep, text_len, ref_latents, transformer_options)
-                state["caches"][key] = ref_kv
-            return _forward_with_cached_refs(dit, x, timestep, context, ref_kv, transformer_options)
+                reuse, upto = None, 0
+                n_blocks = len(dit.layers)
+                for other_skip, other_kv in by_skip.items():
+                    d = _divergence(skipped, other_skip, n_blocks)
+                    if d > upto:
+                        reuse, upto = other_kv, d
+                ref_kv = _precompute_ref_kv(
+                    dit, x, timestep, ref_latents, transformer_options,
+                    reuse=reuse, reuse_upto=upto, store_device=store_device,
+                )
+                by_skip[skipped] = ref_kv
+
+            pe_key = (fp, text_len)
+            ref_pe = state["pes"].get(pe_key)
+            if ref_pe is None:
+                _, refids = _pack_refs(dit, ref_latents, 1, text_len, x.device, x.dtype)
+                ref_pe = _pe(dit, refids)
+                state["pes"][pe_key] = ref_pe
+            return _forward_with_cached_refs(dit, x, timestep, context, ref_kv, ref_pe, transformer_options)
 
         m.add_object_patch("extra_conds", extra_conds)
         m.add_object_patch("extra_conds_shapes", extra_conds_shapes)
         m.add_object_patch("memory_usage_factor_conds", ("ref_latents",))
         m.add_object_patch("diffusion_model.forward", forward)
+        if kv_cache:
+            try:
+                import comfy.patcher_extension as pe_ext
+                m.add_wrapper_with_key(
+                    pe_ext.WrappersMP.OUTER_SAMPLE, "moss_ostris_edit_ref_kv", outer_sample_wrapper
+                )
+            except (ImportError, AttributeError):
+                pass  # older ComfyUI: rely on the sigma-based fallback
         return (m,)
 
 
